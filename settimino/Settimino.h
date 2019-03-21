@@ -33,7 +33,11 @@
 |=============================================================================*/
 #ifndef SETTIMINO_H
 #define SETTIMINO_H
-#include "Platform.h"
+
+#include "mbed.h"
+#include "NetworkInterface.h"
+#include "EthernetInterface.h"
+// #include <stdint.h>
 
 // Memory models
 
@@ -46,7 +50,19 @@
 # define _S7HELPER
 #endif
 
-#pragma pack(1)
+/*Arduino macros*/
+typedef uint16_t word;
+typedef uint8_t byte;
+
+#define lowByte(w) ((uint8_t) ((w) & 0xff))
+#define highByte(w) ((uint8_t) ((w) >> 8))
+
+#define bitRead(value, bit) (((value) >> (bit)) & 0x01)
+#define bitSet(value, bit) ((value) |= (1UL << (bit)))
+#define bitClear(value, bit) ((value) &= ~(1UL << (bit)))
+#define bitWrite(value, bit, bitvalue) (bitvalue ? bitSet(value, bit) : bitClear(value, bit))
+
+// #pragma pack(1)
 // Error Codes 
 // from 0x0001 up to 0x00FF are severe errors, the Client should be disconnected
 // from 0x0100 are S7 Errors such as DB not found or address beyond the limit etc..
@@ -180,13 +196,6 @@ extern S7Helper S7;
 
 #endif // _S7HELPER
 
-//-----------------------------------------------------------------------------
-// Ethernet initialization
-//-----------------------------------------------------------------------------
-void EthernetInit(uint8_t *mac, IPAddress ip);
-//-----------------------------------------------------------------------------
-// S7 Client                                       
-//-----------------------------------------------------------------------------
 class S7Client 
 {
 private:
@@ -197,12 +206,18 @@ private:
 	uint8_t LastPDUType;
 	uint16_t ConnType;
 	
-	IPAddress Peer;
+	// S7 Ip
+	SocketAddress Peer;
 	
 	// Since we can use either an EthernetClient or a WifiClient 
 	// we have to create the class as an ancestor and then resolve
 	// the inherited into S7Client creator.
-	Client *TCPClient;
+	// Client *TCPClient;
+
+	EthernetInterface *_ethernet;
+	TCPSocket *_tcp_client;
+	TCPServer _tcp_server;
+	
 	
 	int PDULength;    // PDU Length negotiated
 	int IsoPduSize();
@@ -225,9 +240,10 @@ public:
 	S7Client(int Media) : S7Client(){}; // Compatibility V1.X
 	~S7Client();
 	// Basic functions
-	void SetConnectionParams(IPAddress Address, uint16_t LocalTSAP, uint16_t RemoteTSAP);
+	int Start(EthernetInterface *ns);
+	void SetConnectionParams(SocketAddress Address, uint16_t LocalTSAP, uint16_t RemoteTSAP);
 	void SetConnectionType(uint16_t ConnectionType);
-	int ConnectTo(IPAddress Address, uint16_t Rack, uint16_t Slot);
+	int ConnectTo(SocketAddress Address, uint16_t Rack, uint16_t Slot);
 	int Connect();
 	void Disconnect();
 	int ReadArea(int Area, uint16_t DBNumber, uint16_t Start, uint16_t Amount, void *ptrData); 

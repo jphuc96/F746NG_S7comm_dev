@@ -358,20 +358,6 @@ void S7Helper::SetStringAt(int index, char *value)
 #endif // _S7HELPER
 
 //-----------------------------------------------------------------------------
-// Ethernet initialization 
-//-----------------------------------------------------------------------------
-void EthernetInit(uint8_t *mac, IPAddress ip)
-{
-#ifdef S7WIRED
-  #ifdef M5STACK_LAN    
-      SPI.begin(18, 19, 23, -1);
-      Ethernet.init(26);
-  #endif  
-      // Start Ethernet
-      Ethernet.begin(mac, ip); 
-#endif    
-}
-//-----------------------------------------------------------------------------
 S7Client::S7Client()
 {
 	// Default TSAP values for connectiong as PG to a S7300 (Rack 0, Slot 2)
@@ -385,18 +371,20 @@ S7Client::S7Client()
 	PDULength = 0;
 	RecvTimeout = 500; // 500 ms
 	
-#ifdef S7WIFI	
-    TCPClient = new(WiFiClient);
-#endif    
-#ifdef S7WIRED 
-    TCPClient = new(EthernetClient);
-#endif    
 }
 //-----------------------------------------------------------------------------
 S7Client::~S7Client()
 {
-	Disconnect();
-	delete TCPClient;
+	// Disconnect();
+	delete _tcp_client;
+}
+//-----------------------------------------------------------------------------
+int S7Client::Start(EthernetInterface *ns)
+{
+	_ethernet = ns;
+	_tcp_client = new TCPSocket(_ethernet);
+	// _tcp_client.open(_ethernet);
+	return 0;
 }
 //-----------------------------------------------------------------------------
 int S7Client::SetLastError(int Error)
@@ -405,39 +393,35 @@ int S7Client::SetLastError(int Error)
 	return Error;
 }
 //-----------------------------------------------------------------------------
-int S7Client::WaitForData(uint16_t Size, uint16_t Timeout)
-{
-	unsigned long Elapsed = millis();
-	uint16_t BytesReady;
+// int S7Client::WaitForData(uint16_t Size, uint16_t Timeout)
+// {
+// 	Timer _t;
+// 	// unsigned long Elapsed = millis();
+// 	uint16_t BytesReady;
+// 	_t.start();
+// 	do
+// 	{
 
-	do
-	{
-		// I don't like next function because imho is buggy, it returns 0 also if _sock==MAX_SOCK_NUM
-		// but it belongs to the standard Ethernet library and there are too many dependencies to skip them.
-		// So be very carefully with the munber of the clients, they must be <=4.
-		BytesReady=TCPClient->available();
-		if (BytesReady<Size)
-			delayMicroseconds(500);
-		else
-			return SetLastError(0);
+// 		_tcp_client.
+// 		if (BytesReady<Size)
+// 			Thread::wait(1);
+// 		else
+// 			return SetLastError(0);
 
-		// Check for rollover - should happen every 52 days without turning off Arduino.
-		if (millis()<Elapsed)
-			Elapsed=millis(); // Resets the counter, in the worst case we will wait some additional millisecs.
+// 	}while(_t.read_ms()<Timeout);	
+// 	_t.reset();
 
-	}while(millis()-Elapsed<Timeout);	
+// 	// Here we are in timeout zone, if there's something into the buffer, it must be discarded.
+// 	if (BytesReady>0)
+// 		_tcp_client->flush();
+// 	else
+// 	{
+// 		if (!_tcp_client->connected())
+// 			return SetLastError(errTCPConnectionReset);
+// 	}
 
-	// Here we are in timeout zone, if there's something into the buffer, it must be discarded.
-	if (BytesReady>0)
-		TCPClient->flush();
-	else
-	{
-		if (!TCPClient->connected())
-			return SetLastError(errTCPConnectionReset);
-	}
-
-	return SetLastError(errTCPDataRecvTout);
-}
+// 	return SetLastError(errTCPDataRecvTout);
+// }
 //-----------------------------------------------------------------------------
 int S7Client::IsoPduSize()
 {
@@ -447,15 +431,28 @@ int S7Client::IsoPduSize()
 //-----------------------------------------------------------------------------
 int S7Client::RecvPacket(uint8_t *buf, uint16_t Size)
 {
-	WaitForData(Size,RecvTimeout);
+	// WaitForData(Size,RecvTimeout);
+	nsapi_size_or_error_t _err;
 	if (LastError!=0)
 		return LastError;
-	if (TCPClient->read(buf, Size)==0)
-		return SetLastError(errTCPConnectionReset);
+	_tcp_client->set_timeout(RecvTimeout);
+	
+	_err = _tcp_client->recv(buf, Size);
+	switch (_err)
+	{
+		case NSAPI_ERROR_CONNECTION_TIMEOUT:
+			return SetLastError(errTCPDataRecvTout);
+			break;
+		case 0:
+			return SetLastError(errTCPConnectionReset);
+			break;
+		default:
+			break;
+	}
 	return SetLastError(0);
 }
-//-----------------------------------------------------------------------------
-void S7Client::SetConnectionParams(IPAddress Address, uint16_t LocalTSAP, uint16_t RemoteTSAP)
+// //-----------------------------------------------------------------------------
+void S7Client::SetConnectionParams(SocketAddress Address, uint16_t LocalTSAP, uint16_t RemoteTSAP)
 {
 	Peer = Address;
 	LocalTSAP_HI = LocalTSAP>>8;
@@ -469,7 +466,7 @@ void S7Client::SetConnectionType(uint16_t ConnectionType)
 	ConnType = ConnectionType;
 }
 //-----------------------------------------------------------------------------
-int S7Client::ConnectTo(IPAddress Address, uint16_t Rack, uint16_t Slot)
+int S7Client::ConnectTo(SocketAddress Address, uint16_t Rack, uint16_t Slot)
 {
 	SetConnectionParams(Address, 0x0100, (ConnType<<8)+(Rack * 0x20) + Slot);
 	return Connect();
@@ -498,7 +495,7 @@ void S7Client::Disconnect()
 {
 	if (Connected)
 	{
-		TCPClient->stop();
+		_tcp_client->close();
 		Connected = false;
 		PDULength = 0;
 		LastError = 0;
@@ -507,7 +504,9 @@ void S7Client::Disconnect()
 //-----------------------------------------------------------------------------
 int S7Client::TCPConnect()
 {
-	if (TCPClient->connect(Peer, isotcp))
+	_tcp_client->open(_ethernet);
+	Peer.set_port(isotcp);
+	if (_tcp_client->connect(Peer) == NSAPI_ERROR_OK )
 		return SetLastError(0);
 	else
 		return SetLastError(errTCPConnectionFailed);
@@ -546,8 +545,6 @@ int S7Client::RecvISOPacket(uint16_t *Size)
 		// We need to align with PDU.DATA
 		RecvPacket(Target, *Size);
 	}
-	if (LastError!=0)
-		TCPClient->flush();
 	return LastError;
 }
 //-----------------------------------------------------------------------------
@@ -561,7 +558,7 @@ int S7Client::ISOConnect()
 	ISO_CR[20]=RemoteTSAP_HI;
 	ISO_CR[21]=RemoteTSAP_LO;
 
-	if (TCPClient->write(&ISO_CR[0], sizeof(ISO_CR))==sizeof(ISO_CR))
+	if (_tcp_client->send(&ISO_CR[0], sizeof(ISO_CR))==sizeof(ISO_CR))
 	{
 		RecvISOPacket(&Length);
 		if ((LastError==0) && (Length==15)) // 15 = 22 (sizeof CC telegram) - 7 (sizeof Header)
@@ -581,7 +578,7 @@ int S7Client::ISOConnect()
 int S7Client::NegotiatePduLength()
 {
 	uint16_t Length;
-	if (TCPClient->write(&S7_PN[0], sizeof(S7_PN))==sizeof(S7_PN))
+	if (_tcp_client->send(&S7_PN[0], sizeof(S7_PN))==sizeof(S7_PN))
 	{
 		RecvISOPacket(&Length);
 		if (LastError==0)                 
@@ -686,7 +683,7 @@ int S7Client::ReadArea(int Area, uint16_t DBNumber, uint16_t Start, uint16_t Amo
         Address = Address >> 8;
         PDU.H[28] = Address & 0x000000FF;
 
-		if (TCPClient->write(&PDU.H[0], Size_RD)==Size_RD)
+		if (_tcp_client->send(&PDU.H[0], Size_RD)==Size_RD)
 		{
 			RecvISOPacket(&Length);
 			if (LastError==0)
@@ -836,7 +833,7 @@ int S7Client::WriteArea(int Area, uint16_t DBNumber, uint16_t Start, uint16_t Am
 		if (ptrData!=NULL)
 			memcpy(&PDU.RAW[35], Source, DataSize);
 
-		if (TCPClient->write(&PDU.H[0], IsoSize)==IsoSize)
+		if (_tcp_client->send(&PDU.H[0], IsoSize)==IsoSize)
 		{
 			RecvISOPacket(&Length);
 			if (LastError==0)
@@ -896,7 +893,7 @@ int S7Client::GetDBSize(uint16_t DBNumber, uint16_t *Size)
     PDU.RAW[34]=(DBNumber / 10)+0x30;
     DBNumber=DBNumber % 10;
     PDU.RAW[35]=(DBNumber / 1)+0x30;
-	if (TCPClient->write(&PDU.H[0], sizeof(S7_BI))==sizeof(S7_BI))
+	if (_tcp_client->send(&PDU.H[0], sizeof(S7_BI))==sizeof(S7_BI))
 	{
 		RecvISOPacket(&Length);
 		if (LastError==0)
@@ -948,7 +945,7 @@ int S7Client::PlcStop()
 	LastError=0;
 	// Setup the telegram
 	memcpy(&PDU.H, S7_STOP, sizeof(S7_STOP)); 
-	if (TCPClient->write(&PDU.H[0], sizeof(S7_STOP))==sizeof(S7_STOP))
+	if (_tcp_client->send(&PDU.H[0], sizeof(S7_STOP))==sizeof(S7_STOP))
 	{
 		RecvISOPacket(&Length);
 		if (LastError==0)
@@ -974,7 +971,7 @@ int S7Client::PlcStart()
 	LastError=0;
 	// Setup the telegram
 	memcpy(&PDU.H, S7_START, sizeof(S7_START)); 
-	if (TCPClient->write(&PDU.H[0], sizeof(S7_START))==sizeof(S7_START))
+	if (_tcp_client->send(&PDU.H[0], sizeof(S7_START))==sizeof(S7_START))
 	{
 		RecvISOPacket(&Length);
 		if (LastError==0)
@@ -1000,7 +997,7 @@ int S7Client::GetPlcStatus(int *Status)
 	LastError=0;
 	// Setup the telegram
 	memcpy(&PDU.H, S7_PLCGETS, sizeof(S7_PLCGETS)); 
-	if (TCPClient->write(&PDU.H[0], sizeof(S7_PLCGETS))==sizeof(S7_PLCGETS))
+	if (_tcp_client->send(&PDU.H[0], sizeof(S7_PLCGETS))==sizeof(S7_PLCGETS))
 	{
 		RecvISOPacket(&Length);
 		if (LastError==0)
@@ -1033,7 +1030,7 @@ int S7Client::IsoExchangeBuffer(uint16_t *Size)
 {
 	LastError=0;
 
-	if (TCPClient->write(&PDU.H[0], int(Size))==*Size)
+	if (_tcp_client->send(&PDU.H[0], int(Size))==*Size)
 		RecvISOPacket(Size);
 	else
 		LastError = errTCPDataSend;
